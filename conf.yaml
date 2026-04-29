@@ -61,10 +61,10 @@ smtp:
 #   url:                指定的RSS地址
 specific_RSS:
   - name: "MRZHU的小站"
-    url: "https://www.sifangbazhu.tech/rss.xml"
+    url: "https://www.sifangbazhu.tech/rss.xml/"
   - name: "白鱼小栈"
-    url: "https://www.baiyuyu.com/rss"
+    url: "https://www.baiyuyu.com/feed/"
   - name: "Yourlai Blog"
-    url: "https://yourlai.com/rss"
+    url: "https://yourlai.com/feed/"
   - name: "LYEy_isine个人博客"
-    url: "https://caiyifeng.top/rss.xml"
+    url: "https://caiyifeng.top/rss.xml/"
