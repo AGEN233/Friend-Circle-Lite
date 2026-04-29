@@ -75,7 +75,21 @@ class FeedParserService:
         """
         try:
             response = self.session.get(feed_url, headers=HEADERS_XML, timeout=timeout)
-            # 强制使用 UTF-8 编码，因为 apparent_encoding 可能检测错误
+
+            # ====== DEBUG 开始 ======
+            print("\n=== DEBUG RSS ===")
+            print("URL:", feed_url)
+            print("Status:", response.status_code)
+            print("Final URL:", response.url)
+            print("Content-Type:", response.headers.get("content-type"))
+            print("HEAD:", response.text[:300].replace("\n", " "))
+            print("Has <rss>:", "<rss" in response.text.lower())
+            print("Has <feed>:", "<feed" in response.text.lower())
+            print("Has <item>:", "<item" in response.text.lower())
+            print("Has <entry>:", "<entry" in response.text.lower())
+            print("=====================\n")
+            # ====== DEBUG 结束 ======
+
             response.encoding = "utf-8"
             feed = feedparser.parse(response.text)
         except Exception as exc:
