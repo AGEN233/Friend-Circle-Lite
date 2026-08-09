@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -12,8 +12,22 @@ import requests
 
 from friend_circle_lite import HEADERS_XML, timeout
 from friend_circle_lite.models import Article, FeedEndpoint
-from friend_circle_lite.utils.time import format_published_time
 from friend_circle_lite.utils.url import replace_non_domain
+
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+def _ensure_url_scheme(url: str) -> str:
+    """补全缺失的 http(s) 协议前缀，并做基础清理，用于抵御上游脏数据。
+
+    例如 ``memno.top`` -> ``https://memno.top``。
+    """
+    url = (url or "").strip()
+    if not url:
+        return url
+    if not urlparse(url).scheme:
+        return "https://" + url
+    return url
 
 
 class FeedDiscoveryService:
@@ -38,8 +52,11 @@ class FeedDiscoveryService:
 
     def discover(self, website_url: str) -> FeedEndpoint | None:
         """Try common feed endpoints and return the first valid match."""
+        # 规范化基址：补全缺失的 http(s) 协议前缀，避免 "No scheme supplied" 报错
+        base_url = _ensure_url_scheme(website_url)
+
         for feed_type, path in self.POSSIBLE_FEEDS:
-            feed_url = website_url.rstrip("/") + path
+            feed_url = base_url.rstrip("/") + path
 
             try:
                 response = self.session.get(feed_url, headers=HEADERS_XML, timeout=timeout)
@@ -99,7 +116,13 @@ class FeedParserService:
         if "html" in content_type or "<!doctype html" in text_head or "<html" in text_head:
             return False, "返回的是 HTML 页面，不是 RSS/XML；可能是验证页、错误页或站点首页"
 
+        # content-type 声称是 xml/atom，但内容不含 feed 根标签。
+        # 进一步排除常见的非 feed XML（如 sitemap、纯错误 XML），避免误判后白等超时。
         if "xml" in content_type or "rss" in content_type or "atom" in content_type:
+            if "<urlset" in text_head or "sitemap" in text_head:
+                return False, "返回的是 Sitemap XML，不是 RSS/Atom"
+            if "<error" in text_head or "<exception" in text_head or "<message" in text_head:
+                return False, "返回的是错误 XML 内容，不是 RSS/Atom"
             return True, "OK"
 
         return False, f"返回内容不像 RSS/Atom，Content-Type={content_type or 'unknown'}"
@@ -139,75 +162,82 @@ class FeedParserService:
         articles: list[Article] = []
 
         for entry in feed.entries:
+            title = (entry.get("title") or "").strip() if "title" in entry else ""
             published = self._extract_published_time(entry)
-            article_link = replace_non_domain(entry.link, blog_url) if "link" in entry else ""
+            article_link = replace_non_domain(entry.link, blog_url) if "link" in entry and entry.link else ""
+
+            # 过滤明显无效的条目：无标题、无链接或无法解析出时间的文章直接跳过
+            if not title or not article_link or not published:
+                if not title:
+                    logging.warning(f"跳过无标题的文章条目: {entry!r}")
+                elif not article_link:
+                    logging.warning(f"跳过无链接的文章: {title}")
+                continue
 
             article = Article(
-                title=entry.title if "title" in entry else "",
+                title=title,
                 author=default_author,
                 link=article_link,
                 published=published,
-                summary=entry.summary if "summary" in entry else "",
+                summary=entry.get("summary", "") if "summary" in entry else "",
                 content=entry.content[0].value
                 if "content" in entry and entry.content
-                else entry.description
+                else entry.get("description", "")
                 if "description" in entry
                 else "",
             )
             articles.append(article)
 
-        valid_articles = [article for article in articles if article.published]
-
-        valid_articles_with_dates = []
-        for article in valid_articles:
-            try:
-                parsed_date = datetime.strptime(article.published, "%Y-%m-%d %H:%M")
-                valid_articles_with_dates.append((article, parsed_date))
-            except ValueError:
-                logging.warning(f"文章 {article.title} 的发布时间格式异常: {article.published}，已跳过")
-
-        valid_articles_with_dates.sort(key=lambda item: item[1], reverse=True)
-        sorted_articles = [item[0] for item in valid_articles_with_dates]
-
-        return sorted_articles[:count] if count < len(sorted_articles) else sorted_articles
+        # 按发布时间降序排序，取最新的 count 篇
+        articles.sort(key=lambda article: article.published, reverse=True)
+        return articles[:count]
 
     @staticmethod
     def _extract_published_time(entry) -> str:
-        """Extract a normalized publish time from a feed entry."""
+        """Extract a normalized publish time (``YYYY-MM-DD HH:MM``) from a feed entry.
+
+        优先取 ``published``，其次回退到 ``updated``。返回空字符串表示无法解析，
+        由调用方决定是否过滤该文章。
+        """
         import time
+        from dateutil import parser as date_parser
 
-        def convert_time_to_string(time_value):
+        title = entry.get("title", "Unknown")
+
+        def to_normalized_str(time_value) -> str:
             if isinstance(time_value, str):
-                return time_value
-
-            if isinstance(time_value, time.struct_time):
-                if time_value.tm_year < 1900:
-                    logging.warning(
-                        f"文章 {entry.get('title', 'Unknown')} 的时间年份异常: {time_value.tm_year}，已跳过"
-                    )
+                if not time_value.strip():
                     return ""
-                return time.strftime("%Y-%m-%dT%H:%M:%SZ", time_value)
-
-            logging.warning(
-                f"文章 {entry.get('title', 'Unknown')} 的时间格式未知: {type(time_value)}，已跳过"
-            )
-            return ""
-
-        if "published" in entry:
-            time_str = convert_time_to_string(entry.published)
-            if not time_str:
+                try:
+                    parsed = date_parser.parse(time_value, fuzzy=True)
+                except (ValueError, date_parser.ParserError, OverflowError):
+                    logging.warning(f"文章 {title} 的发布时间无法解析: {time_value!r}，已跳过")
+                    return ""
+            elif isinstance(time_value, time.struct_time) or isinstance(time_value, datetime):
+                if isinstance(time_value, time.struct_time):
+                    parsed = datetime(*time_value[:6], tzinfo=timezone.utc)
+                else:
+                    parsed = time_value
+            else:
+                logging.warning(f"文章 {title} 的时间格式未知: {type(time_value)}，已跳过")
                 return ""
-            return format_published_time(time_str)
 
-        if "updated" in entry:
-            time_str = convert_time_to_string(entry.updated)
-            if not time_str:
+            if parsed.year < 1900:
+                logging.warning(f"文章 {title} 的时间年份异常: {parsed.year}，已跳过")
                 return ""
-            published = format_published_time(time_str)
-            logging.warning(f"文章 {entry.title} 未包含发布时间，已使用更新时间 {published}")
-            return published
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M")
 
-        logging.warning(f"文章 {entry.title} 未包含任何时间信息, 请检查原文, 跳过该文章")
+        for key in ("published", "updated"):
+            if key in entry:
+                normalized = to_normalized_str(entry[key])
+                if normalized:
+                    if key == "updated":
+                        logging.warning(f"文章 {title} 未包含发布时间，已使用更新时间 {normalized}")
+                    return normalized
+
+        logging.warning(f"文章 {title} 未包含任何时间信息, 请检查原文, 跳过该文章")
         return ""
 
 
